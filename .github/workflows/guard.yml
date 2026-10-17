@@ -1,0 +1,80 @@
+# Guardia del merge automático: falla si un PR toca algo que debe esperar a
+# Miguel (migraciones o esquema de datos, autenticación, borrar funcionalidad,
+# o la propia CI), salvo que el PR lleve la etiqueta ok-miguel.
+#
+# Es un check obligatorio en el ruleset de main ("guard / check"): mientras
+# falla, el auto-merge espera. Poner la etiqueta relanza el check y, si pasa,
+# el PR se fusiona solo. Solo Miguel pone esa etiqueta.
+#
+# Uso, en .github/workflows/guard.yml de la app:
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, labeled, unlabeled]
+#   jobs:
+#     guard:
+#       permissions: {pull-requests: read}
+#       uses: miguelplanas/ci/.github/workflows/guard.yml@main
+#       with:
+#         extra: ''   # regex extra de rutas sensibles de esta app, una por línea
+name: guard
+
+on:
+  workflow_call:
+    inputs:
+      extra:
+        description: Regex extra (ERE, una por línea) de rutas sensibles de la app
+        type: string
+        default: ''
+      label:
+        type: string
+        default: ok-miguel
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Does this PR need Miguel?
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          LABEL: ${{ inputs.label }}
+          EXTRA: ${{ inputs.extra }}
+        run: |
+          set -eu
+          [ -n "$PR" ] || { echo "Not a pull request, nothing to guard."; exit 0; }
+
+          # Rutas sensibles: datos, auth y la CI (que podría desactivar esta guardia).
+          cat > patterns <<'EOF'
+          (^|/)migrations?/
+          (^|/|[-_])schema([-_./]|$)
+          \.sql$
+          (^|/|[-_])o?auth([-_./]|$)
+          (^|/|[-_])(sessions?|passwords?|login|logout)([-_./]|$)
+          ^\.github/
+          EOF
+          printf '%s\n' "$EXTRA" >> patterns
+          sed -i 's/^ *//; /^$/d' patterns
+
+          gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | "\(.status)\t\(.filename)"' > files
+          echo "Changed files:"; cat files
+
+          # Los tests no cambian lo que hace la app: no frenan el merge.
+          hits=$(cut -f2 files | grep -vE '^(test|tests)/|\.test\.' | grep -E -f patterns || true)
+          # Borrar ficheros de la app es borrar funcionalidad; tests y docs no cuentan.
+          removed=$(awk -F'\t' '$1=="removed"{print $2}' files | grep -vE '^(test|tests|docs)/|\.md$' || true)
+
+          if [ -z "$hits$removed" ]; then
+            echo "Nothing sensitive: auto-merge can proceed."
+            exit 0
+          fi
+          echo "Sensitive changes:"
+          [ -n "$hits" ] && echo "$hits" | sed 's/^/  touched: /'
+          [ -n "$removed" ] && echo "$removed" | sed 's/^/  removed: /'
+          if echo "$LABELS" | jq -e --arg l "$LABEL" 'index($l)' >/dev/null; then
+            echo "Label $LABEL present: approved by Miguel."
+            exit 0
+          fi
+          echo "::error::This PR touches sensitive paths. It waits for Miguel: add the '$LABEL' label to approve it."
+          exit 1

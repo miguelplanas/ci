@@ -1,0 +1,105 @@
+# Despliega una app (o un compose) de Dokploy en prod y espera el resultado real.
+#
+# prod no tiene dirección pública: GitHub no puede llamarle, así que el runner
+# entra al tailnet como nodo efímero con tag:ci y habla con la API de Dokploy
+# desde dentro. Dokploy contesta en cuanto encola, por eso el job apunta cuál era
+# el último despliegue, lanza uno nuevo y espera a que ese acabe en done o error.
+#
+# Uso, en el ci.yml de la app (job que solo corre en push a main tras los tests):
+#   deploy:
+#     needs: test
+#     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+#     permissions: {contents: read, id-token: write}
+#     uses: miguelplanas/ci/.github/workflows/deploy-dokploy.yml@main
+#     with:
+#       app-id: ${{ vars.DOKPLOY_APP_ID }}
+#     secrets: inherit
+#
+# Secrets: DOKPLOY_API_KEY y, para Tailscale, TS_OAUTH_CLIENT_ID más
+# TS_AUDIENCE (identidad federada, preferida) o TS_OAUTH_SECRET.
+name: deploy-dokploy
+
+on:
+  workflow_call:
+    inputs:
+      app-id:
+        description: applicationId (o composeId si kind es compose) en Dokploy
+        required: true
+        type: string
+      kind:
+        description: application o compose
+        type: string
+        default: application
+      dokploy-url:
+        type: string
+        default: http://prod:3000
+    secrets:
+      DOKPLOY_API_KEY:
+        required: true
+      TS_OAUTH_CLIENT_ID:
+        required: true
+      TS_AUDIENCE:
+        required: false
+      TS_OAUTH_SECRET:
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # secrets no se puede usar directamente en un if
+      USE_WIF: ${{ secrets.TS_AUDIENCE != '' }}
+    steps:
+      - name: Join the tailnet (workload identity)
+        if: env.USE_WIF == 'true'
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+
+      - name: Join the tailnet (OAuth secret)
+        if: env.USE_WIF != 'true'
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Deploy and wait for the real outcome
+        env:
+          API: ${{ inputs.dokploy-url }}/api
+          KIND: ${{ inputs.kind }}
+          ID: ${{ inputs.app-id }}
+          API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+        run: |
+          set -eu
+          case "$KIND" in
+            application) KEY=applicationId ;;
+            compose) KEY=composeId ;;
+            *) echo "::error::kind must be application or compose"; exit 1 ;;
+          esac
+          [ -n "$ID" ] || { echo "::error::app-id is empty (is the DOKPLOY_APP_ID variable set?)"; exit 1; }
+
+          latest() {
+            curl -fsS --max-time 30 -H "x-api-key: $API_KEY" "$API/$KIND.one?$KEY=$ID" |
+              jq -c '[.deployments[]] | sort_by(.createdAt) | last // {}'
+          }
+
+          before=$(latest | jq -r '.createdAt // ""')
+          curl -fsS --max-time 60 -X POST -H "x-api-key: $API_KEY" -H 'Content-Type: application/json' \
+            -d "{\"$KEY\":\"$ID\"}" "$API/$KIND.deploy" >/dev/null
+          echo "Deploy queued, waiting for it to finish."
+
+          while :; do
+            sleep 10
+            dep=$(latest)
+            [ "$(echo "$dep" | jq -r '.createdAt // ""')" = "$before" ] && { echo "not registered yet"; continue; }
+            status=$(echo "$dep" | jq -r '.status')
+            echo "Deployment status: $status"
+            case "$status" in
+              done) echo 'Live in production.'; exit 0 ;;
+              error) echo "::error::Dokploy build failed: $(echo "$dep" | jq -r '.errorMessage // .title'). Log on prod: $(echo "$dep" | jq -r .logPath)"; exit 1 ;;
+            esac
+          done
