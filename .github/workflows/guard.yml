@@ -1,10 +1,15 @@
-# Guardia del merge automático: falla si un PR toca algo que debe esperar a
+# Guardia del merge automático: frena un PR que toca algo que debe esperar a
 # Miguel (migraciones o esquema de datos, autenticación, borrar funcionalidad,
-# o la propia CI), salvo que el PR lleve la etiqueta ok-miguel.
+# o la propia CI), salvo que lleve la etiqueta ok-miguel.
 #
-# Es un check obligatorio en el ruleset de main ("guard / check"): mientras
-# falla, el auto-merge espera. Poner la etiqueta relanza el check y, si pasa,
-# el PR se fusiona solo. Solo Miguel pone esa etiqueta.
+# Frena sin fallar: deja en el commit un estado "ok-miguel" pendiente, que el
+# ruleset de main exige en éxito. Así el auto-merge espera y GitHub no manda
+# correos de "workflow failed" por algo que no es un fallo. Poner la etiqueta
+# relanza la guardia, el estado pasa a éxito y el PR se fusiona solo. Solo
+# Miguel pone esa etiqueta.
+#
+# Si la app no da permiso statuses: write, no puede dejar el estado y vuelve
+# al modo antiguo: falla el job ("guard / check").
 #
 # Uso, en .github/workflows/guard.yml de la app:
 #   on:
@@ -12,7 +17,7 @@
 #       types: [opened, synchronize, reopened, labeled, unlabeled]
 #   jobs:
 #     guard:
-#       permissions: {pull-requests: read}
+#       permissions: {pull-requests: read, statuses: write}
 #       uses: miguelplanas/ci/.github/workflows/guard.yml@main
 #       with:
 #         extra: ''   # regex extra de rutas sensibles de esta app, una por línea
@@ -38,12 +43,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           LABEL: ${{ inputs.label }}
           EXTRA: ${{ inputs.extra }}
         run: |
           set -eu
           [ -n "$PR" ] || { echo "Not a pull request, nothing to guard."; exit 0; }
+
+          # Deja el veredicto como estado "ok-miguel" del commit. Si no hay
+          # permiso para escribirlo, devuelve error y se usa el modo antiguo.
+          verdict() {
+            gh api -X POST "repos/$REPO/statuses/$SHA" -f context=ok-miguel \
+              -f state="$1" -f description="$2" >/dev/null 2>&1
+          }
 
           # Rutas sensibles: datos, auth y la CI (que podría desactivar esta guardia).
           cat > patterns <<'EOF'
@@ -67,6 +80,7 @@ jobs:
 
           if [ -z "$hits$removed" ]; then
             echo "Nothing sensitive: auto-merge can proceed."
+            verdict success "No toca nada sensible" || true
             exit 0
           fi
           echo "Sensitive changes:"
@@ -74,6 +88,11 @@ jobs:
           [ -n "$removed" ] && echo "$removed" | sed 's/^/  removed: /'
           if echo "$LABELS" | jq -e --arg l "$LABEL" 'index($l)' >/dev/null; then
             echo "Label $LABEL present: approved by Miguel."
+            verdict success "Aprobado por Miguel" || true
+            exit 0
+          fi
+          if verdict pending "Espera la etiqueta $LABEL"; then
+            echo "::notice::This PR touches sensitive paths. It waits for Miguel: add the '$LABEL' label to approve it."
             exit 0
           fi
           echo "::error::This PR touches sensitive paths. It waits for Miguel: add the '$LABEL' label to approve it."
